@@ -8,13 +8,17 @@ import sys
 
 import rospy
 import actionlib
+import tf
+#import moveit_commander
+
 from actionlib import GoalStatus
 from message_filters import Subscriber
-from moveit_msgs.msg import MoveGroupAction, MoveGroupGoal, Constraints, PositionConstraint, BoundingVolume, OrientationConstraint
+from moveit_msgs.msg import MoveGroupAction, MoveGroupGoal, Constraints, JointConstraint, PositionConstraint, BoundingVolume, OrientationConstraint
 from geometry_msgs.msg import *
 from math import pi, tau, dist, fabs, cos
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import Range
+from tf.listener import TransformListener
 
 from applevision_rospkg.srv import Tf2TransformPoseStamped
 from applevision_rospkg.msg import RegionOfInterestWithConfidenceStamped, PointWithCovarianceStamped
@@ -30,6 +34,257 @@ SYNC_TICK = 0.5
 MOVE_TOLERANCE = 0.01
 LOG_PREFIX = sys.argv[0]
 
+def getpose():
+    moveit_commander.roscpp_initialize(sys.argv)
+    rospy.init_node('move_group_python_interface_tutorial',anonymous=True)
+    robot = moveit_commander.RobotCommander()
+    group = moveit_commander.MoveGroupCommander("endeffector")
+
+    print(group.get_current_pose())
+
+## @brief Pure python interface to move_group action
+class MoveGroupInterface(object):
+
+    ## @brief Constructor for this utility
+    ## @param group Name of the MoveIt! group to command
+    ## @param frame Name of the fixed frame in which planning happens
+    ## @param move_group Name of the action server
+    ## @param listener A TF listener instance (optional, will create a new one if None)
+    ## @param plan_only Should we only plan, but not execute?
+    def __init__(self, group=GROUP_NAME, frame=WORLD_FRAME, listener=None, plan_only=False, move_group="move_group"):
+        self._group = group
+        self._fixed_frame = frame
+        self._action = actionlib.SimpleActionClient(move_group,
+                                                    MoveGroupAction)
+        rospy.init_node('applevision_motion')
+        self._action.wait_for_server()
+        if listener == None:
+            self._listener = TransformListener()
+        else:
+            self._listener = listener
+        self.plan_only = plan_only
+        self.planner_id = None
+        self.planning_time = 15.0
+
+    def get_move_action(self):
+        return self._action
+
+    ## @brief Move the arm to set of joint position goals
+    def moveToJointPosition(self,
+                            joints,
+                            positions,
+                            tolerance=0.01,
+                            wait=True,
+                            **kwargs):
+        # Check arguments
+        supported_args = ("max_velocity_scaling_factor",
+                          "planner_id",
+                          "planning_scene_diff",
+                          "planning_time",
+                          "plan_only",
+                          "start_state")
+        for arg in kwargs.keys():
+            if not arg in supported_args:
+                rospy.loginfo("moveToJointPosition: unsupported argument: %s",
+                              arg)
+
+        # Create goal
+        g = MoveGroupGoal()
+
+        # 1. fill in workspace_parameters
+
+        # 2. fill in start_state
+        try:
+            g.request.start_state = kwargs["start_state"]
+        except KeyError:
+            g.request.start_state.is_diff = True
+
+        # 3. fill in goal_constraints
+        c1 = Constraints()
+        for i in range(len(joints)):
+            c1.joint_constraints.append(JointConstraint())
+            c1.joint_constraints[i].joint_name = joints[i]
+            c1.joint_constraints[i].position = positions[i]
+            c1.joint_constraints[i].tolerance_above = tolerance
+            c1.joint_constraints[i].tolerance_below = tolerance
+            c1.joint_constraints[i].weight = 1.0
+        g.request.goal_constraints.append(c1)
+
+        # 4. fill in path constraints
+
+        # 5. fill in trajectory constraints
+
+        # 6. fill in planner id
+        try:
+            g.request.planner_id = kwargs["planner_id"]
+        except KeyError:
+            if self.planner_id:
+                g.request.planner_id = self.planner_id
+
+        # 7. fill in group name
+        g.request.group_name = self._group
+
+        # 8. fill in number of planning attempts
+        try:
+            g.request.num_planning_attempts = kwargs["num_attempts"]
+        except KeyError:
+            g.request.num_planning_attempts = 1
+
+        # 9. fill in allowed planning time
+        try:
+            g.request.allowed_planning_time = kwargs["planning_time"]
+        except KeyError:
+            g.request.allowed_planning_time = self.planning_time
+
+        # Fill in velocity scaling factor
+        try:
+            g.request.max_velocity_scaling_factor = kwargs["max_velocity_scaling_factor"]
+        except KeyError:
+            pass  # do not fill in at all
+
+        # 10. fill in planning options diff
+        try:
+            g.planning_options.planning_scene_diff = kwargs["planning_scene_diff"]
+        except KeyError:
+            g.planning_options.planning_scene_diff.is_diff = True
+            g.planning_options.planning_scene_diff.robot_state.is_diff = True
+
+        # 11. fill in planning options plan only
+        try:
+            g.planning_options.plan_only = kwargs["plan_only"]
+        except KeyError:
+            g.planning_options.plan_only = self.plan_only
+
+        # 12. fill in other planning options
+        g.planning_options.look_around = False
+        g.planning_options.replan = False
+
+        # 13. send goal
+        self._action.send_goal(g)
+        if wait:
+            self._action.wait_for_result()
+            return self._action.get_result()
+        else:
+            return None
+
+    ## @brief Move the arm, based on a goal pose_stamped for the end effector.
+    def moveToPose(self,
+                   pose_stamped,
+                   gripper_frame,
+                   tolerance=0.01,
+                   wait=True,
+                   **kwargs):
+        # Check arguments
+        supported_args = ("max_velocity_scaling_factor",
+                          "planner_id",
+                          "planning_time",
+                          "plan_only",
+                          "start_state")
+        for arg in kwargs.keys():
+            if not arg in supported_args:
+                rospy.loginfo("moveToPose: unsupported argument: %s",
+                              arg)
+
+        # Create goal
+        g = MoveGroupGoal()
+        pose_transformed = self._listener.transformPose(self._fixed_frame, pose_stamped)
+
+        # 1. fill in request workspace_parameters
+
+        # 2. fill in request start_state
+        try:
+            g.request.start_state = kwargs["start_state"]
+        except KeyError:
+            g.request.start_state.is_diff = True
+
+        # 3. fill in request goal_constraints
+        c1 = Constraints()
+
+        c1.position_constraints.append(PositionConstraint())
+        c1.position_constraints[0].header.frame_id = self._fixed_frame
+        c1.position_constraints[0].link_name = gripper_frame
+        b = BoundingVolume()
+        s = SolidPrimitive()
+        s.dimensions = [tolerance * tolerance]
+        s.type = s.SPHERE
+        b.primitives.append(s)
+        b.primitive_poses.append(pose_transformed.pose)
+        c1.position_constraints[0].constraint_region = b
+        c1.position_constraints[0].weight = 1.0
+
+        c1.orientation_constraints.append(OrientationConstraint())
+        c1.orientation_constraints[0].header.frame_id = self._fixed_frame
+        c1.orientation_constraints[0].orientation = pose_transformed.pose.orientation
+        c1.orientation_constraints[0].link_name = gripper_frame
+        c1.orientation_constraints[0].absolute_x_axis_tolerance = tolerance
+        c1.orientation_constraints[0].absolute_y_axis_tolerance = tolerance
+        c1.orientation_constraints[0].absolute_z_axis_tolerance = tolerance
+        c1.orientation_constraints[0].weight = 1.0
+
+        g.request.goal_constraints.append(c1)
+
+        # 4. fill in request path constraints
+
+        # 5. fill in request trajectory constraints
+
+        # 6. fill in request planner id
+        try:
+            g.request.planner_id = kwargs["planner_id"]
+        except KeyError:
+            if self.planner_id:
+                g.request.planner_id = self.planner_id
+
+        # 7. fill in request group name
+        g.request.group_name = self._group
+
+        # 8. fill in request number of planning attempts
+        try:
+            g.request.num_planning_attempts = kwargs["num_attempts"]
+        except KeyError:
+            g.request.num_planning_attempts = 1
+
+        # 9. fill in request allowed planning time
+        try:
+            g.request.allowed_planning_time = kwargs["planning_time"]
+        except KeyError:
+            g.request.allowed_planning_time = self.planning_time
+
+        # Fill in velocity scaling factor
+        try:
+            g.request.max_velocity_scaling_factor = kwargs["max_velocity_scaling_factor"]
+        except KeyError:
+            pass  # do not fill in at all
+
+        # 10. fill in planning options diff
+        g.planning_options.planning_scene_diff.is_diff = True
+        g.planning_options.planning_scene_diff.robot_state.is_diff = True
+
+        # 11. fill in planning options plan only
+        try:
+            g.planning_options.plan_only = kwargs["plan_only"]
+        except KeyError:
+            g.planning_options.plan_only = self.plan_only
+
+        # 12. fill in other planning options
+        g.planning_options.look_around = False
+        g.planning_options.replan = False
+
+        # 13. send goal
+        self._action.send_goal(g)
+        if wait:
+            self._action.wait_for_result()
+            return self._action.get_result()
+        else:
+            return None
+
+    ## @brief Sets the planner_id used for all future planning requests.
+    ## @param planner_id The string for the planner id, set to None to clear
+    def setPlannerId(self, planner_id):
+        self.planner_id = str(planner_id)
+
+    ## @brief Set default planning time to be used for future planning request.
+    def setPlanningTime(self, time):
+        self.planning_time = time
 
 class MotionPlanner():
     def __init__(self):
@@ -41,109 +296,6 @@ class MotionPlanner():
 
     def stop(self):
         self.move_group_action.cancel_all_goals()
-    
-    def all_close(goal, actual, tolerance):
-    
-    # Convenience method for testing if the values in two lists are within a tolerance of each other.
-    # For Pose and PoseStamped inputs, the angle between the two quaternions is compared (the angle
-    # between the identical orientations q and -q is calculated correctly).
-    # @param: goal       A list of floats, a Pose or a PoseStamped
-    # @param: actual     A list of floats, a Pose or a PoseStamped
-    # @param: tolerance  A float
-    # @returns: bool
-    
-        if type(goal) is list:
-            for index in range(len(goal)):
-                if abs(actual[index] - goal[index]) > tolerance:
-                    return False
-
-        elif type(goal) is geometry_msgs.msg.PoseStamped:
-            return all_close(goal.pose, actual.pose, tolerance)
-
-        elif type(goal) is geometry_msgs.msg.Pose:
-            x0, y0, z0, qx0, qy0, qz0, qw0 = pose_to_list(actual)
-            x1, y1, z1, qx1, qy1, qz1, qw1 = pose_to_list(goal)
-            # Euclidean distance
-            d = dist((x1, y1, z1), (x0, y0, z0))
-            # phi = angle between orientations
-            cos_phi_half = fabs(qx0 * qx1 + qy0 * qy1 + qz0 * qz1 + qw0 * qw1)
-            return d <= tolerance and cos_phi_half >= cos(tolerance / 2.0)
-
-        return True
-
-
-    def go_to_joint_state(self):
-        # Copy class variables to local variables to make the web tutorials more clear.
-        # In practice, you should use the class variables directly unless you have a good
-        # reason not to.
-        move_group = self.move_group
-
-        ## BEGIN_SUB_TUTORIAL plan_to_joint_state
-        ##
-        ## Planning to a Joint Goal
-        ## ^^^^^^^^^^^^^^^^^^^^^^^^
-        ## The Panda's zero configuration is at a `singularity <https://www.quora.com/Robotics-What-is-meant-by-kinematic-singularity>`_, so the first
-        ## thing we want to do is move it to a slightly better configuration.
-        ## We use the constant `tau = 2*pi <https://en.wikipedia.org/wiki/Turn_(angle)#Tau_proposals>`_ for convenience:
-        # We get the joint values from the group and change some of the values:
-        joint_goal = move_group.get_current_joint_values()
-        joint_goal[0] = 0
-        joint_goal[1] = -tau / 8
-        joint_goal[2] = 0
-        joint_goal[3] = -tau / 4
-        joint_goal[4] = 0
-        joint_goal[5] = tau / 6  # 1/6 of a turn
-        joint_goal[6] = 0
-
-        # The go command can be called with joint values, poses, or without any
-        # parameters if you have already set the pose or joint target for the group
-        move_group.go(joint_goal, wait=True)
-
-        # Calling ``stop()`` ensures that there is no residual movement
-        move_group.stop()
-
-        ## END_SUB_TUTORIAL
-
-        # For testing:
-        current_joints = move_group.get_current_joint_values()
-        return all_close(joint_goal, current_joints, 0.01)
-
-
-    def go_to_pose_goal(self):
-        # Copy class variables to local variables to make the web tutorials more clear.
-        # In practice, you should use the class variables directly unless you have a good
-        # reason not to.
-        move_group = self.move_group
-
-        ## BEGIN_SUB_TUTORIAL plan_to_pose
-        ##
-        ## Planning to a Pose Goal
-        ## ^^^^^^^^^^^^^^^^^^^^^^^
-        ## We can plan a motion for this group to a desired pose for the
-        ## end-effector:
-        pose_goal = geometry_msgs.msg.Pose()
-        pose_goal.orientation.w = 1.0
-        pose_goal.position.x = 0.4
-        pose_goal.position.y = 0.1
-        pose_goal.position.z = 0.4
-
-        move_group.set_pose_target(pose_goal)
-
-        ## Now, we call the planner to compute the plan and execute it.
-        plan = move_group.go(wait=True)
-        # Calling `stop()` ensures that there is no residual movement
-        move_group.stop()
-        # It is always good to clear your targets after planning with poses.
-        # Note: there is no equivalent function for clear_joint_value_targets()
-        move_group.clear_pose_targets()
-
-        ## END_SUB_TUTORIAL
-
-        # For testing:
-        # Note that since this section of code will not be included in the tutorials
-        # we use the class variable rather than the copied state variable
-        current_pose = self.move_group.get_current_pose().pose
-        return all_close(pose_goal, current_pose, 0.01)
 
     def is_in_motion(self) -> bool:
         status = self.move_group_action.get_state()
@@ -269,8 +421,8 @@ class AppleApproach():
             if not cam.w:
                 return None
             # center the robot
-            self.planner.start_move_to_pose((kal.point[0], kal.point[1], 0), MOVE_TOLERANCE)
-            return (AppleApproach.State.CENTER_IN_MOTION, f'centering: {kal.point[0], kal.point[1]}')
+            # self.planner.start_move_to_pose((kal.point[0], kal.point[1], 0), MOVE_TOLERANCE)
+            # return (AppleApproach.State.CENTER_IN_MOTION, f'centering: {kal.point[0], kal.point[1]}')
 
         # if we're close enough, stop
         if kal.point[2] <= AppleApproach.STOP_DIST_Z:
@@ -320,7 +472,7 @@ class AppleApproach():
 
 def main():
     rospy.init_node('applevision_motion')
-    rospy.wait_for_service('Tf2TransformPoseStamped')
+    #rospy.wait_for_service('Tf2TransformPoseStamped')
 
     planner = MotionPlanner()
     approach = AppleApproach(planner)
